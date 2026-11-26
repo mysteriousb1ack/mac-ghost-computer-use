@@ -1,8 +1,9 @@
 # MacGhost Computer Use
 
-> **The missing native macOS Computer Use plugin for Google Antigravity (and any MCP host) — Text-Only AX Tree Diffs, 32-Step Action Batches, Focus Auditing, and Zero Dependencies.**
+> **The missing native macOS Computer Use plugin for Google Antigravity (and standard STDIO MCP hosts) — Text-Only AX Tree Diffs, 32-Step Action Batches, Focus Auditing, and Zero Dependencies.**
 
 [![For Google Antigravity](https://img.shields.io/badge/Built%20for-Google%20Antigravity-0F766E?style=flat-square)](#quick-start)
+[![MCP Hosts](https://img.shields.io/badge/Works%20with-Claude%20%7C%20Cursor%20%7C%20Codex-4F46E5?style=flat-square)](#2-connect-to-your-mcp-host)
 [![macOS 14+ Apple Silicon](https://img.shields.io/badge/macOS-14%2B%20Apple%20Silicon-111827?style=flat-square&logo=apple&logoColor=white)](#requirements)
 [![MCP Protocol](https://img.shields.io/badge/MCP-STDIO%202025--11--25-0284C7?style=flat-square)](#mcp-tools)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-0%20npm%20%7C%200%20SwiftPM-1D4ED8?style=flat-square)](#architecture)
@@ -10,18 +11,37 @@
 
 [简体中文文档 (Chinese)](README_ZH.md)
 
-![MacGhost Architecture Overview](assets/hero_architecture.png)
+### Real macOS Capture (Zero Mockups · Stationary Cursor · Focus Audited)
+
+![MacGhost v2.0.2 Live macOS Demo](assets/demo_real.gif)
+
+*Unedited screen recording on Apple Silicon (`mac-ghost-computer-use v2.0.2`): the physical cursor stays parked in the top-left box and pre/post/settled focus samples report `focusPreserved: true` while MacGhost writes to background TextEdit, runs a 5-step Calculator batch (`88 × 9 = 792`), and refuses `list_windows({ app: "Keychain Access" })` with `SENSITIVE_TARGET`.*
+
+```bash
+git clone https://github.com/mysteriousb1ack/mac-ghost-computer-use.git && cd mac-ghost-computer-use
+./build.sh && ./build.sh test && node --test tests/test_mac_ghost.mjs
+```
+
+### Measured Payload Comparison (`v2.0.2` Real Run)
+
+Measured on the same live windows during the recording above (comparing single-window `capture_window` PNG bytes vs. `get_state` text-only AX payload bytes; vision-model token billing varies by provider):
+
+| Live Window Scenario | Window PNG (`capture_window`) | Full AX Tree (`get_state full`) | Incremental AX Diff (`get_state`) | Diff Size Reduction | Foreground Focus |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **TextEdit** background AX write | 20,167 B (19.7 KB) | 2,264 B | **323 B** | **62.4× smaller** | `focusPreserved: true` |
+| **Calculator** 5-step batch (`8 8 × 9 =` → `792`) | 27,660 B (27.0 KB) | 6,128 B | **4,333 B** | **6.4× smaller** | `focusPreserved: true` |
+| **Keychain Access** (`list_windows` guardrail check) | — | — | `SENSITIVE_TARGET` | — | Refused (`ok: false`) |
 
 ---
 
 ## Why MacGhost?
 
-**Google Antigravity** ships with powerful coding, terminal, and browser subagents — **but it does not yet ship with a native desktop Computer Use engine** for controlling local macOS apps (Finder, Notes, WPS/Office, MarginNote, Keynote, WeChat, etc.). Meanwhile, traditional screenshot-based Computer Use tools send megabytes of full-screen PNGs every turn, burn vision tokens, break prompt caching, and hijack your foreground window.
+**Google Antigravity** ships with powerful coding, terminal, and browser subagents — **but it does not yet ship with a native desktop Computer Use engine** for controlling local macOS apps (Finder, Notes, WPS/Office, MarginNote, Keynote, WeChat, etc.). Meanwhile, traditional screenshot-based Computer Use tools send large window/screen PNGs every turn, burn vision tokens, break prompt caching, and hijack your foreground window.
 
 **MacGhost v2.0.2** fills that gap from scratch on native Apple APIs (`Accessibility`, `ScreenCaptureKit`, `CoreGraphics`) and a zero-dependency Node.js 22 MCP server:
 
 - **Text-first, image-optional**: `get_state` reads a compact Accessibility (AX) control tree with stable `e<id>` refs and returns **incremental frame diffs** (`remove_ranges` + `upsert`) by default — zero image payload on normal UI workflows. Fall back to `capture_window` with normalized crops and `6×4` coordinate grids only for canvas or unlabeled surfaces.
-- **Up to 32 steps per round-trip**: `run_actions` executes sequential actions, waits, and assertions (`ax_press`, `ax_set_value`, `click`, `scroll`, `type_text`, `press_key`, `paste`, `perform_secondary_action`, `drag`, `select_text`, `wait`, `assert`) in one MCP call, stopping immediately on stale frames or focus drift.
+- **Up to 32 steps per round-trip**: `run_actions` executes sequential actions, waits, and assertions (`ax_press`, `ax_set_value`, `click`, `scroll`, `type_text`, `press_key`, `paste`, `perform_secondary_action`, `drag`, `select_text`, `wait`, `assert`) in one MCP call, aborting remaining steps on stale frames or unexpected post-action focus drift (canvas drags with `allow_activate: true` are validated separately).
 - AX reads, presses and value writes operate in the background. `paste`, `type_text` and `press_key` require a focused control in the target app. Their `posted_unverified` receipt confirms event posting only. Use an assertion or read back state to verify the effect. A canvas drag with `allow_activate: true` explicitly brings the target window forward.
 - Legacy writes sample foreground focus before delivery, immediately afterward and after 150 ms. V2 samples again after UISettler’s 1–5 s observation period. Focus restoration is opt-in.
 - Paste detects external clipboard changes and attempts to restore the original items while it still owns the clipboard. Inspect `receipts[].clipboardRestore`. HTML accepts attribute-free formatting tags.
@@ -31,6 +51,8 @@
 ---
 
 ## Architecture
+
+![MacGhost Architecture Overview](assets/hero_architecture.png)
 
 ```text
 MCP Host (Antigravity / Claude Desktop / Cursor / Codex)
@@ -162,7 +184,7 @@ Restart the MCP host and re-run `check_permissions` after changing permissions. 
 MacGhost enforces guardrails in both the Node server and Swift helper ([`src/guardrails.json`](src/guardrails.json)):
 
 - Denies automation against Keychain, Passwords, 1Password, `SecurityAgent`, `System Settings`, Touch ID, Apple Pay, and detected payment / verification / CAPTCHA dialogs.
-- Legacy coordinate writes require a verified AX hit in the requested window. Capture verifies the window tree before and after capture and refuses an incomplete inspection (192-node limit).
+- Legacy coordinate writes require a verified AX hit in the requested window. Capture verifies the target window plus any attached sheets/dialogs/modals before and after capture, and refuses if a dialog inspection is incomplete (192-node dialog scan limit).
 - Strips titles of protected windows from enumeration output.
 - Logs timestamp, tool name, and outcome category only (no typed secrets) to `.local/audit.jsonl` (`0600`).
 
