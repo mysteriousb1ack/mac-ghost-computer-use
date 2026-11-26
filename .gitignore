@@ -1,0 +1,6 @@
+.build/
+.local/
+bin/
+tests/.test-*/
+.DS_Store
+*.swp
