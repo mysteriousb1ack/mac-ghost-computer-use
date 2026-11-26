@@ -63,7 +63,7 @@ private struct SessionParams {
     }
 }
 
-private struct SessionTarget {
+struct SessionTarget {
     let ax: AXTarget
     let owned: [Window]
     let windowID: CGWindowID?
@@ -444,12 +444,22 @@ private final class HelperSession {
                 if !allowActivate {
                     _ = try t.hit(pathPoints[0], in: w, expected: item)
                 }
+                // The parent closes this socket on timeout. Peek without consuming
+                // the next JSON request, so a disconnected host cannot strand mouseDown.
+                func verifyPeer() throws {
+                    var byte: UInt8 = 0
+                    let n = recv(STDIN_FILENO, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+                    if n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOTSOCK && errno != EINTR) {
+                        throw Failure("SESSION_CLOSED", "Drag host disconnected.")
+                    }
+                }
                 return try await postDragPath(
                     pid: pid, window: w, points: pathPoints,
                     durationMs: p.int("duration_ms", 0...5000, 300),
                     allowActivate: allowActivate,
                     target: t.ax, policy: t.ax.policy,
                     validateStep: {
+                        try verifyPeer()
                         let live = try refresh()
                         guard try live.window().bounds == w.bounds else {
                             throw Failure("STALE_WINDOW", "Drag window moved.")
@@ -653,6 +663,20 @@ private final class HelperSession {
     }
 }
 
+func finishSessionReceipt(_ response: inout Object) {
+    var code = response["code"] as? String
+    if code == nil {
+        if let restore = response["clipboardRestore"] as? String, restore != "restored" {
+            code = restore == "changed_externally" ? "CLIPBOARD_CHANGED" : "CLIPBOARD_RESTORE_FAILED"
+        } else if response["partial"] as? Bool == true || response["mouseUpPosted"] as? Bool == false ||
+                    response["posted"] as? Bool == false || ["not_sent", "unknown"].contains(response["pasteEffect"] as? String ?? "") {
+            code = "INCOMPLETE_ACTION"
+        }
+    }
+    response["ok"] = code == nil
+    if let code { response["error"] = ["code": code, "message": "Action did not complete cleanly."] }
+}
+
 @MainActor
 func runSession(pid: pid_t, policyLoader: () throws -> Guardrails) async throws {
     guard pid > 0 else { throw invalid("pid must be positive.") }
@@ -708,7 +732,7 @@ func runSession(pid: pid_t, policyLoader: () throws -> Guardrails) async throws 
 
             response = try await session.handle(op, SessionParams(raw: params),
                                                  load: policyLoader)
-            response["ok"] = true
+            finishSessionReceipt(&response)
             close = op == "close"
         } catch {
             let failure = error as? Failure ?? Failure("NATIVE_ERROR", "Native request failed.")

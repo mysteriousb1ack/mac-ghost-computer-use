@@ -165,7 +165,7 @@ func postKeyChord(_ chord: KeyChord, to pid: pid_t) throws -> Object {
         try append(modifier.code, down: false)
     }
     for event in events { event.postToPid(pid) }
-    return ["deliveryMode": deliveryMode, "posted": true]
+    return ["deliveryMode": deliveryMode, "posted": true, "delivery": "posted_unverified"]
 }
 
 private func checkActionElement(_ item: AXUIElement, policy: Guardrails) throws {
@@ -176,6 +176,19 @@ private func checkActionElement(_ item: AXUIElement, policy: Guardrails) throws 
         title: stringAttr(item, kAXTitleAttribute),
         description: stringAttr(item, kAXDescriptionAttribute)
     ) else { throw Failure("SENSITIVE_TARGET", "Protected or unidentified control.") }
+}
+
+@MainActor
+func withMouseButtonHeld(down: () -> Void, up: () -> Bool,
+                         move: () async throws -> Void) async -> (Error?, Bool) {
+    var released = false
+    var failure: Error?
+    do {
+        defer { released = up() }
+        down()
+        do { try await move() } catch { failure = error }
+    }
+    return (failure, released)
 }
 
 /// 支持单段或多点一笔画路径拖动。
@@ -208,7 +221,7 @@ func postDragPath(
               let live = NSRunningApplication(processIdentifier: pid) else { return false }
         return live.isEqual(process)
     }
-    func validate(_ point: CGPoint) throws {
+    func validate(_ point: CGPoint, foreground: Bool = false) throws {
         try Task.checkCancellation()
         try validateStep()
         guard sameInstance() else {
@@ -223,10 +236,18 @@ func postDragPath(
         if let target, !CFEqual(target.app, live.app) {
             throw Failure("STALE_WINDOW", "Accessibility application changed.")
         }
-        if !allowActivate {
+        if foreground {
+            let focus = readFocus(policy)
+            let receiver = try windows(true).first { $0.bounds.contains(point) }
+            guard focus.pid == pid, focus.details["windowId"] as? CGWindowID == window.id,
+                  receiver?.id == window.id, receiver?.pid == pid else {
+                throw Failure("FOCUS_CHANGED", "Target window is no longer focused.")
+            }
+        }
+        if !allowActivate || foreground {
             var hit: AXUIElement?
             guard AXUIElementCopyElementAtPosition(
-                live.app, Float(point.x), Float(point.y), &hit
+                foreground ? AXUIElementCreateSystemWide() : live.app, Float(point.x), Float(point.y), &hit
             ) == .success, let hit else {
                 throw Failure("TARGET_UNAVAILABLE", "Cannot verify the drag point.")
             }
@@ -266,16 +287,18 @@ func postDragPath(
     let savedCursor = allowActivate ? CGEvent(source: nil)?.location : nil
     if allowActivate {
         // 显式前台手势：短暂激活目标应用并抬起目标窗口
-        _ = process.activate(options: [.activateIgnoringOtherApps])
-        if let live = try? AXTarget(pid, policy),
-           let axWin = live.roots.first(where: {
-               axRect(attr($0, kAXPositionAttribute), attr($0, kAXSizeAttribute)) == window.bounds
-           }) {
-            _ = AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
+        let live = try AXTarget(pid, policy)
+        let roots = live.roots.filter {
+            axRect(attr($0, kAXPositionAttribute), attr($0, kAXSizeAttribute)) == window.bounds
+        }
+        guard roots.count == 1, process.activate(options: []),
+              AXUIElementPerformAction(roots[0], kAXRaiseAction as CFString) == .success else {
+            throw Failure("TARGET_UNAVAILABLE", "Cannot activate and raise the target window.")
         }
         try await Task.sleep(nanoseconds: 180_000_000)
         // 先将鼠标移动到起点，让画布追踪区完成进入
         let move = try buildEvent(.mouseMoved, at: start)
+        try validate(start, foreground: true)
         emit(move)
         try await Task.sleep(nanoseconds: 30_000_000)
     }
@@ -309,46 +332,36 @@ func postDragPath(
 
     let release = try buildEvent(.leftMouseUp, at: start)
     let down = try buildEvent(.leftMouseDown, at: start)
-    try validate(start)
-    emit(down)
-    if allowActivate { try await Task.sleep(nanoseconds: 25_000_000) }
+    try validate(start, foreground: allowActivate)
     var last = start
     let steps = max(globalPoints.count * 2, min(180, max(8, durationMs / 8)))
     let stepNs: UInt64 = durationMs > 0 ? UInt64(max(4, durationMs / steps)) * 1_000_000 : 0
-    do {
+    let (error, released) = await withMouseButtonHeld(down: { emit(down) }, up: {
+        guard allowActivate || sameInstance() else { return false }
+        release.location = last
+        emit(release)
+        return true
+    }) {
+        if allowActivate { try await Task.sleep(nanoseconds: 25_000_000) }
         for s in 1...steps {
             let t = Double(s) / Double(steps)
             let p = pointAt(t)
-            if s % 6 == 0 || s == steps { try validate(p) }
+            if allowActivate || s % 6 == 0 || s == steps { try validate(p, foreground: allowActivate) }
             emit(try buildEvent(.leftMouseDragged, at: p))
             last = p
             if stepNs > 0 { try await Task.sleep(nanoseconds: stepNs) }
         }
-        try validate(last)
-    } catch {
-        let canRelease = sameInstance()
-        if canRelease {
-            release.location = last
-            emit(release)
-        }
-        if let savedCursor, let restoreMove = try? buildEvent(.mouseMoved, at: savedCursor) {
-            restoreMove.post(tap: .cghidEventTap)
-        }
-        return ["partial": true, "mouseUpPosted": canRelease,
+        try validate(last, foreground: allowActivate)
+    }
+    if let error {
+        return ["partial": true, "mouseUpPosted": released,
                 "code": (error as? Failure)?.code ??
                     (error is CancellationError ? "CANCELLED" : "VALIDATION_FAILED"),
                 "windowId": window.id,
                 "deliveryMode": allowActivate ? "cg_hid_activated" : deliveryMode]
     }
-    release.location = last
-    emit(release)
-    if allowActivate {
-        try await Task.sleep(nanoseconds: 40_000_000)
-        if let savedCursor, let restoreMove = try? buildEvent(.mouseMoved, at: savedCursor) {
-            restoreMove.post(tap: .cghidEventTap)
-        }
-    }
-    return ["partial": false, "mouseUpPosted": true, "windowId": window.id,
+    if let savedCursor { CGWarpMouseCursorPosition(savedCursor) }
+    return ["partial": !released, "mouseUpPosted": released, "windowId": window.id,
             "pointCount": globalPoints.count,
             "deliveryMode": allowActivate ? "cg_hid_activated" : deliveryMode]
 }

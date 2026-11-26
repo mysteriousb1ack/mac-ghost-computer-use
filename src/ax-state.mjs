@@ -35,6 +35,9 @@ export function createSessionPool({
       clearTimeout(idle);
       if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
 
+      // A killed helper cannot release a held global mouse button. Closing stdin
+      // lets the drag observe peer shutdown and unwind its native cleanup first.
+      const finishingDrag = active?.op === 'drag' && active.sent;
       const effectiveGracefulMs = gracefulMs > 0
         ? gracefulMs
         : (active?.op === 'paste' && active.sent ? 1200 : 0);
@@ -48,7 +51,9 @@ export function createSessionPool({
       active = undefined;
       chunks = [];
       size = 0;
-      if (effectiveGracefulMs > 0) {
+      if (finishingDrag) {
+        child.stdin.end();
+      } else if (effectiveGracefulMs > 0) {
         // 对正在执行的 paste 事务给予短暂优雅退出窗口，允许 Swift 完成剪贴板还原再退出。
         child.stdin.end();
         const killTimer = setTimeout(() => child.kill('SIGKILL'), effectiveGracefulMs);

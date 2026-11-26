@@ -18,12 +18,13 @@
 
 **Google Antigravity** ships with powerful coding, terminal, and browser subagents — **but it does not yet ship with a native desktop Computer Use engine** for controlling local macOS apps (Finder, Notes, WPS/Office, MarginNote, Keynote, WeChat, etc.). Meanwhile, traditional screenshot-based Computer Use tools send megabytes of full-screen PNGs every turn, burn vision tokens, break prompt caching, and hijack your foreground window.
 
-**MacGhost v2.0** fills that gap from scratch on native Apple APIs (`Accessibility`, `ScreenCaptureKit`, `CoreGraphics`) and a zero-dependency Node.js 22 MCP server:
+**MacGhost v2.0.1** fills that gap from scratch on native Apple APIs (`Accessibility`, `ScreenCaptureKit`, `CoreGraphics`) and a zero-dependency Node.js 22 MCP server:
 
 - **Text-first, image-optional**: `get_state` reads a compact Accessibility (AX) control tree with stable `e<id>` refs and returns **incremental frame diffs** (`remove_ranges` + `upsert`) by default — zero image payload on normal UI workflows. Fall back to `capture_window` with normalized crops and `6×4` coordinate grids only for canvas or unlabeled surfaces.
 - **Up to 32 steps per round-trip**: `run_actions` executes sequential actions, waits, and assertions (`ax_press`, `ax_set_value`, `click`, `scroll`, `type_text`, `press_key`, `paste`, `perform_secondary_action`, `drag`, `select_text`, `wait`, `assert`) in one MCP call, stopping immediately on stale frames or focus drift.
-- **Background-first & focus-audited**: Targets specific `pid` / `window_id` windows without hijacking your desktop. Every write operation records `focusAudit` (before / after / +150ms foreground sampling) with opt-in `restore_focus`.
-- **Rich-text clipboard-safe paste**: `paste` handles plain text, Markdown, and HTML while backing up and restoring your original clipboard automatically.
+- AX reads, presses and value writes operate in the background. `paste`, `type_text` and `press_key` require a focused control in the target app. Their `posted_unverified` receipt confirms event posting only. Use an assertion or read back state to verify the effect. A canvas drag with `allow_activate: true` explicitly brings the target window forward.
+- Legacy writes sample foreground focus before delivery, immediately afterward and after 150 ms. V2 samples again after UISettler’s 1–5 s observation period. Focus restoration is opt-in.
+- Paste detects external clipboard changes and attempts to restore the original items while it still owns the clipboard. Inspect `receipts[].clipboardRestore`. HTML accepts attribute-free formatting tags.
 - **Built-in guardrails & local audit**: Blocks sensitive targets (`SecurityAgent`, Keychain, Passwords, 1Password, Touch ID, Apple Pay, System Settings, CAPTCHA/payment prompts) via [`src/guardrails.json`](src/guardrails.json) and writes 0600-permission call logs to `.local/audit.jsonl`.
 - **Zero external dependencies**: Pure Swift 5.9 (`swift build -c release`) + Node.js 22 standard library. No `npm install`, no Python runtime, no Electron overhead.
 
@@ -41,7 +42,7 @@ src/mcp-server.mjs  ──►  src/ax-state.mjs & src/run-actions.mjs
 bin/mac-ghost-helper (Native ARM64 Swift binary, zero SwiftPM deps)
    ├── Accessibility API   ──► Compact AX snapshots, incremental diffs, AXPress / AXSetValue
    ├── CoreGraphics Events ──► Process-targeted clicks, scrolls, chords, multi-point drags
-   ├── FocusGuard          ──► Pre/post/+150ms frontmost audit & opt-in focus restoration
+   ├── FocusGuard          ──► Legacy +150 ms / v2 UISettler focus audit & opt-in restoration
    └── ScreenCaptureKit    ──► On-demand cropped window PNGs with coordinate grids
 ```
 
@@ -50,7 +51,7 @@ bin/mac-ghost-helper (Native ARM64 Swift binary, zero SwiftPM deps)
 ## Requirements
 
 - **macOS 14.0+** on **Apple Silicon (arm64)**
-- **Xcode Command Line Tools** (`swift` 5.9+)
+- Source builds require Xcode Command Line Tools with Swift 5.9+ and the macOS 14.2+ SDK.
 - **Node.js 22+**
 
 ---
@@ -85,13 +86,13 @@ node --test tests/test_mac_ghost.mjs
 
 #### Generic MCP Client (Claude Desktop / Cursor / Windsurf / Custom Host)
 
-Add the following to your MCP configuration, replacing `/path/to/mac-ghost-computer-use` with your local clone path:
+Add the following to your MCP configuration, replacing `/path/to/mac-ghost-computer-use` with your local clone path. Set `command` to the absolute Node executable path printed by `node -p 'process.execPath'`:
 
 ```json
 {
   "mcpServers": {
     "mac-ghost": {
-      "command": "node",
+      "command": "/absolute/path/to/node",
       "args": ["/path/to/mac-ghost-computer-use/src/mcp-server.mjs"]
     }
   }
@@ -105,7 +106,7 @@ Run `check_permissions` from your MCP host, then enable the host app in:
 1. **System Settings → Privacy & Security → Accessibility** (for AX tree inspection & control actions)
 2. **System Settings → Privacy & Security → Screen & System Audio Recording** (only needed if you call `capture_window`)
 
-Restart the MCP host and re-run `check_permissions` to verify `accessibility`, `postEvents`, and `screenRecording` return `true`.
+Restart the MCP host and re-run `check_permissions` after changing permissions. Basic AX operations require only Accessibility (`accessibility: true`). Event posting also checks `postEvents`. For screenshots, additionally verify `screenRecording: true`.
 
 ---
 
@@ -124,7 +125,7 @@ Restart the MCP host and re-run `check_permissions` to verify `accessibility`, `
 | :--- | :--- |
 | `type_text` | Single-line text entry into a referenced or focused control (rejects raw newlines). |
 | `press_key` | Send xdotool-style chords (`Return`, `Tab`, `super+s`, `super+shift+Left`). |
-| `paste` | Multi-format paste (`text` / `md` / `html`) with automatic clipboard backup & restore. |
+| `paste` | Multi-format paste (`text` / `md` / `html`) with external-change detection and best-effort clipboard restoration. |
 | `perform_secondary_action` | Invoke an explicit AX action such as `AXShowMenu` or `AXIncrement`. |
 | `drag` | Smooth drag between two points or a multi-point stroke path (supports canvas drawing with opt-in `allow_activate`). |
 | `select_text` | UTF-16 range text selection or cursor placement (`prefix`/`suffix` disambiguation). |
@@ -161,6 +162,7 @@ Restart the MCP host and re-run `check_permissions` to verify `accessibility`, `
 MacGhost enforces guardrails in both the Node server and Swift helper ([`src/guardrails.json`](src/guardrails.json)):
 
 - Denies automation against Keychain, Passwords, 1Password, `SecurityAgent`, `System Settings`, Touch ID, Apple Pay, and detected payment / verification / CAPTCHA dialogs.
+- Legacy coordinate writes require a verified AX hit in the requested window. Capture verifies the window tree before and after capture and refuses an incomplete inspection (192-node limit).
 - Strips titles of protected windows from enumeration output.
 - Logs timestamp, tool name, and outcome category only (no typed secrets) to `.local/audit.jsonl` (`0600`).
 

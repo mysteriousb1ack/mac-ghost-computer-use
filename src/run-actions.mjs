@@ -6,6 +6,7 @@ const schemas = new Map(tools.map(tool => [tool.name, tool.inputSchema]));
 const publicCodes = new Set((
   'INVALID_ARGUMENT STALE_FRAME STALE_ELEMENT STALE_SNAPSHOT STALE_WINDOW ' +
   'TARGET_UNAVAILABLE WINDOWS_UNAVAILABLE SENSITIVE_TARGET AX_PERMISSION EVENT_PERMISSION ' +
+  'INCOMPLETE_ACTION CANCELLED VALIDATION_FAILED CLIPBOARD_RESTORE_FAILED CLIPBOARD_WRITE_FAILED UNSAFE_HTML PASTE_SEND_FAILED ' +
   'NO_FOCUSED_CONTROL DISABLED_CONTROL UNSUPPORTED_ACTION READ_ONLY OUT_OF_BOUNDS ' +
   'TEXT_NOT_FOUND AMBIGUOUS_TEXT MULTILINE_TEXT CLIPBOARD_CHANGED CLIPBOARD_UNREADABLE ' +
   'HELPER_FAILED HELPER_PROTOCOL SESSION_CLOSED TIMEOUT STATE_LIMIT ' +
@@ -122,6 +123,7 @@ function sanitizeFocusAudit(raw) {
   else if ((raw.status === 'preserved' || raw.status === 'unchanged') && raw.focusPreserved === true) status = 'preserved';
   else status = 'unverified';
   const out = { status, focusPreserved: status === 'preserved', beforeFrontmost: raw.beforeFrontmost, afterFrontmost: raw.afterFrontmost };
+  if (raw.immediateFrontmost) out.immediateFrontmost = raw.immediateFrontmost;
   if (raw.restoration) out.restoration = raw.restoration;
   if (raw.afterRestoreFrontmost) out.afterRestoreFrontmost = raw.afterRestoreFrontmost;
   if (typeof raw.warning === 'string') out.warning = raw.warning;
@@ -189,6 +191,7 @@ export async function executeRunActions(deps, args) {
   let effect = 'not_started';
   let focusAudit = null;
   let failure;
+  const receipts = [];
 
   try {
     validate('run_actions', args);
@@ -245,7 +248,7 @@ export async function executeRunActions(deps, args) {
       } else {
         await preflight(deps, op, target, work);
         focusAudit = null;
-        const reply = checked(await bounded(work, ms => {
+        const reply = await bounded(work, ms => {
           effect = 'unknown';
           const pasteWait = op === 'paste' ? Math.min(600, Math.max(50, Math.floor(ms / 3))) : undefined;
           return deps.pool.request(pid, op, {
@@ -253,13 +256,28 @@ export async function executeRunActions(deps, args) {
             return_diff: false, settle_ms: Math.min(5000, Math.max(1000, ms - 50)),
             ...(pasteWait !== undefined ? { paste_wait_ms: pasteWait } : {}),
           }, ms);
-        }));
-
-        effect = 'applied';
+        });
+        const receipt = Object.fromEntries(['posted', 'pasteEffect', 'code', 'clipboardRestore',
+          'partial', 'mouseUpPosted', 'delivery', 'deliveryMode', 'windowId', 'pointCount']
+          .filter(key => Object.hasOwn(reply, key)).map(key => [key, reply[key]]));
+        receipts.push({ index: completed, op, ...receipt });
         focusAudit = sanitizeFocusAudit(reply.focusAudit);
-        const expectedActivate = op === 'drag' && fields.allow_activate === true;
-        if (focusAudit.status === 'changed' && !expectedActivate) throw fault('FOCUS_CHANGED');
+        const unsent = reply.posted === false || reply.pasteEffect === 'not_sent';
+        const partial = reply.partial === true || reply.mouseUpPosted === false;
+        const restoreFailed = reply.clipboardRestore !== undefined && reply.clipboardRestore !== 'restored';
+        if (unsent || partial || restoreFailed || reply.code || reply.pasteEffect === 'unknown') {
+          effect = unsent ? 'not_started' : partial ? 'partial' : 'unknown';
+          throw fault(reply.code ?? reply.error?.code ?? (restoreFailed ? 'CLIPBOARD_RESTORE_FAILED' : 'INCOMPLETE_ACTION'));
+        }
+        checked(reply);
+        effect = 'applied';
         if (focusAudit.status === 'unverified') throw fault('FOCUS_UNVERIFIED');
+        if (op === 'drag' && fields.allow_activate === true) {
+          const observations = [focusAudit.afterFrontmost];
+          if (focusAudit.status === 'changed') observations.push(focusAudit.immediateFrontmost);
+          if (!observations.every(front => front?.pid === pid && front.activeWindow?.status === 'focused' &&
+              front.activeWindow.windowId === window_id)) throw fault('FOCUS_CHANGED');
+        } else if (focusAudit.status === 'changed') throw fault('FOCUS_CHANGED');
       }
 
       resultAuditStarted = true;
@@ -301,17 +319,17 @@ export async function executeRunActions(deps, args) {
     return {
       ok: false, completed, failed_index: completed, effect,
       error: { code: failure, message: 'Operation stopped; inspect returned state before retrying.' },
-      focusAudit, state,
+      receipts, focusAudit, state,
     };
   }
   if (readbackFailure) {
     return {
       ok: false, completed, phase: 'readback', effect: completed > 0 ? 'applied' : 'not_started',
       error: { code: readbackFailure, message: 'Actions completed, but final state readback failed.' },
-      focusAudit, state,
+      receipts, focusAudit, state,
     };
   }
-  return { ok: true, completed, focusAudit, state };
+  return { ok: true, completed, receipts, focusAudit, state };
 }
 
 export async function executeSingleAction(deps, name, args) {

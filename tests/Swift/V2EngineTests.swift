@@ -145,6 +145,61 @@ final class V2EngineTests: XCTestCase {
     }
 
     @MainActor
+    func testNativeUnsentPasteAndIncompleteSessionReceipts() async throws {
+        let board = MockPasteboard(items: [])
+        board.mutateAfterWrite = { board.changeCount += 1 }
+        var result = try await performPasteTransaction(text: "content", format: "text", board: board,
+            sendCmdV: { XCTFail("Clipboard ownership was lost before posting.") }, settleWait: {})
+        finishSessionReceipt(&result)
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertEqual(result["posted"] as? Bool, false)
+        XCTAssertEqual(result["clipboardRestore"] as? String, "changed_externally")
+        XCTAssertEqual((result["error"] as? Object)?["code"] as? String, "CLIPBOARD_CHANGED")
+
+        for var receipt: Object in [["partial": true], ["mouseUpPosted": false], ["clipboardRestore": "restore_failed"]] {
+            finishSessionReceipt(&receipt)
+            XCTAssertEqual(receipt["ok"] as? Bool, false)
+        }
+    }
+
+    func testAXTransportFailureIsNotAnAbsentAttribute() throws {
+        for status: AXError in [.cannotComplete, .apiDisabled, .invalidUIElement] {
+            XCTAssertThrowsError(try verifiedAXValue(status, nil)) {
+                XCTAssertEqual(($0 as? Failure)?.code, "AX_UNAVAILABLE")
+            }
+        }
+        XCTAssertNil(try verifiedAXValue(.attributeUnsupported, nil))
+    }
+
+    @MainActor
+    func testDragReleasesOnceOnCancellationAndReportsReleaseFailure() async {
+        for canRelease in [true, false] {
+            var events: [String] = []
+            let (error, released) = await withMouseButtonHeld(down: { events.append("down") }, up: {
+                events.append("up")
+                return canRelease
+            }) { throw CancellationError() }
+            XCTAssertTrue(error is CancellationError)
+            XCTAssertEqual(released, canRelease)
+            XCTAssertEqual(events, ["down", "up"])
+        }
+    }
+
+    @MainActor
+    func testHTMLResourcesRejectedBeforeImport() throws {
+        for html in ["<img src='https://example.invalid/a'>", "<iframe src='http://example.invalid'>",
+                     "<link href='file:///etc/hosts'>", "<IMG SRC=data:text/plain,test>",
+                     "<p style='background:url(//example.invalid)'>x</p>", "<svg><image href='relative'/></svg>"] {
+            XCTAssertThrowsError(try buildPasteItems(text: html, format: "html")) {
+                XCTAssertEqual(($0 as? Failure)?.code, "UNSAFE_HTML")
+            }
+        }
+        let item = try XCTUnwrap(buildPasteItems(text: "<b>hello</b>", format: "html").first)
+        XCTAssertNotNil(item[.rtf])
+        XCTAssertEqual(item[.string], Data("hello".utf8))
+    }
+
+    @MainActor
     func testPasteTransactionRestoresMultiItemAndRespectsExternalChange() async throws {
         let sentinel = "SECRET_SENTINEL_99812"
         let origItem1: PasteItemData = [.string: Data("原文本1".utf8), .html: Data("<b>原文本1</b>".utf8)]

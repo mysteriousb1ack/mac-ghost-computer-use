@@ -7,7 +7,8 @@ umask 077
 if [ -n "${MACGHOST_BUILD_DIR:-}" ]; then
     work="$MACGHOST_BUILD_DIR"
 else
-    work="$HOME/Library/Caches/mac-ghost-build"
+    repo_hash=$(pwd -P | shasum -a 256 | cut -d ' ' -f 1)
+    work="$HOME/Library/Caches/mac-ghost-build/$repo_hash"
 fi
 mkdir -p "$work/tmp"
 TMPDIR=$(stat -f '/.vol/%d/%i' "$work/tmp")

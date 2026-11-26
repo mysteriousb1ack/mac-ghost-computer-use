@@ -21,10 +21,10 @@ function toolError(code, message, focusAudit) {
   };
 }
 
-function session(runner) {
+function session(runner, { maxBatchItems = 32, maxBatchBytes = 8 * 1024 * 1024, maxBatchMs = 30000 }) {
   let phase = 'new', version;
 
-  async function handle(msg) {
+  async function handle(msg, deadline) {
     if (!object(msg) || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string' ||
         (Object.hasOwn(msg, 'id') && !(typeof msg.id === 'string' || Number.isSafeInteger(msg.id)))) {
       return invalid(null, -32600, 'Invalid JSON-RPC request.');
@@ -58,7 +58,7 @@ function session(runner) {
       return invalid(id, -32602, 'Unknown tool or invalid arguments object.');
     }
     try {
-      return ok(id, await runner(params.name, params.arguments ?? {}));
+      return ok(id, await runner(params.name, params.arguments ?? {}, deadline));
     } catch (error) {
       const auditFailed = error?.code === 'AUDIT_UNAVAILABLE';
       return ok(id, toolError(
@@ -76,9 +76,35 @@ function session(runner) {
     if (version !== '2025-03-26' || phase !== 'ready' || !value.length) {
       return invalid(null, -32600, 'Batch unavailable in this session.');
     }
+    if (value.length > maxBatchItems) return invalid(null, -32600, 'Batch item limit exceeded.');
+    const deadline = performance.now() + maxBatchMs;
     const replies = [];
-    for (const msg of value) {
-      const reply = await handle(msg);
+    // Reserve space for one bounded error per remaining request, including long string IDs.
+    const errors = value.map(msg => object(msg) && msg.jsonrpc === '2.0' &&
+      typeof msg.method === 'string' && !Object.hasOwn(msg, 'id') ? undefined :
+      invalid(typeof msg?.id === 'string' || Number.isSafeInteger(msg?.id) ? msg.id : null,
+        -32000, 'Batch limit reached. Inspect state before retrying.'));
+    const size = reply => reply === undefined ? 0 : Buffer.byteLength(JSON.stringify(reply)) + 1;
+    let bytes = 2 + errors.reduce((sum, reply) => sum + size(reply), 0);
+    if (bytes > maxBatchBytes) return invalid(null, -32600, 'Batch response budget exceeded.');
+    let stopped = false;
+    for (const [index, msg] of value.entries()) {
+      const fallback = errors[index];
+      let reply = fallback;
+      const ms = Math.floor(deadline - performance.now());
+      if (!stopped && ms > 0) {
+        let timer;
+        try {
+          reply = await Promise.race([handle(msg, deadline), new Promise(resolve => {
+            timer = setTimeout(() => { stopped = true; resolve(fallback); }, ms);
+          })]);
+        } finally { clearTimeout(timer); }
+        bytes += size(reply) - size(fallback);
+        if (bytes > maxBatchBytes || performance.now() >= deadline) {
+          stopped = true;
+          reply = fallback;
+        }
+      }
       if (reply !== undefined) replies.push(reply);
     }
     return replies.length ? replies : undefined;
@@ -161,7 +187,7 @@ async function* readMessages(stream) {
 
 export async function serve({ input = process.stdin, output = process.stdout, ...config } = {}) {
   const runner = createRunner(config);
-  const dispatch = session(runner);
+  const dispatch = session(runner, config);
   try {
     for await (const frame of readMessages(input)) {
       let reply;

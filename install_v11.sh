@@ -20,12 +20,12 @@ for (let i = 0; i < args.length; i++) {
 if (basename(dest) !== name || dest === process.cwd() || process.platform !== 'darwin' ||
     process.arch !== 'arm64' || Number(process.versions.node.split('.')[0]) < 22) throw new Error('Check destination, Apple Silicon and Node 22+.');
 const parent = dirname(dest), backups = join(dirname(parent), 'mac-ghost-backups');
-const files = ['bin/mac-ghost-helper', 'src', 'skills', 'assets', 'README.md', 'LICENSE', 'plugin.json'];
+const files = ['bin/mac-ghost-helper', 'src', 'skills', 'assets', 'README.md', 'README_ZH.md', 'LICENSE', 'plugin.json'];
 for (const file of files) await access(file);
 await access(files[0], constants.X_OK);
 const help = JSON.parse(execFileSync(resolve(files[0]), ['--help'], { encoding: 'utf8' }));
 const manifest = JSON.parse(await readFile('plugin.json', 'utf8'));
-if (manifest.name !== name || manifest.version !== '2.0.0' || !help.commands['find-controls'] || !help.commands['session']) throw new Error('Build the v2.0 release first.');
+if (manifest.name !== name || manifest.version !== '2.0.1' || !help.commands['find-controls'] || !help.commands['session']) throw new Error('Build the v2.0.1 release first.');
 const config = JSON.parse(await readFile('mcp_config.json', 'utf8'));
 config.mcpServers['mac-ghost'].command = process.execPath;
 

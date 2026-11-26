@@ -161,12 +161,26 @@ func actions(_ e: AXUIElement) -> [String] {
     guard AXUIElementCopyActionNames(e, &names) == .success else { return [] }
     return names as? [String] ?? []
 }
+func verifiedAXValue(_ status: AXError, _ value: CFTypeRef?) throws -> CFTypeRef? {
+    switch status {
+    case .success: return value
+    case .attributeUnsupported, .noValue: return nil
+    default: throw Failure("AX_UNAVAILABLE", "Cannot verify target accessibility attributes.")
+    }
+}
+
+func policyAttribute(_ item: AXUIElement, _ key: String) throws -> CFTypeRef? {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(item, key as CFString, &value)
+    return try verifiedAXValue(status, value)
+}
+
 func checkElement(_ e: AXUIElement, _ policy: Guardrails) throws {
-    if stringAttr(e, kAXSubroleAttribute) == kAXSecureTextFieldSubrole {
+    if try policyAttribute(e, kAXSubroleAttribute) as? String == kAXSecureTextFieldSubrole {
         throw Failure("SENSITIVE_TARGET", "Protected input field.")
     }
     for key in [kAXTitleAttribute, kAXDescriptionAttribute] {
-        try policy.check("", "", stringAttr(e, key))
+        try policy.check("", "", policyAttribute(e, key) as? String ?? "")
     }
 }
 
@@ -176,11 +190,18 @@ func checkDialog(_ root: AXUIElement, _ policy: Guardrails) throws {
     var pending = [root], visited = 0
     while let item = pending.popLast() {
         visited += 1
+        let role = stringAttr(item, kAXRoleAttribute)
+        guard !role.isEmpty else { throw Failure("AX_UNAVAILABLE", "Cannot inspect control role.") }
         try checkElement(item, policy)
-        if stringAttr(item, kAXRoleAttribute) == kAXStaticTextRole {
-            try policy.check("", "", stringAttr(item, kAXValueAttribute))
+        if role == kAXStaticTextRole {
+            try policy.check("", "", policyAttribute(item, kAXValueAttribute) as? String ?? "")
         }
-        let children = elements(item, kAXChildrenAttribute)
+        var raw: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(item, kAXChildrenAttribute as CFString, &raw)
+        let children: [AXUIElement]
+        if status == .attributeUnsupported || status == .noValue { children = [] }
+        else if status == .success, let items = raw as? [AXUIElement] { children = items }
+        else { throw Failure("AX_UNAVAILABLE", "Cannot inspect child controls.") }
         guard children.count + pending.count + visited <= 192 else {
             throw Failure("TARGET_UNAVAILABLE", "Cannot fully inspect the active dialog.")
         }
@@ -200,20 +221,20 @@ struct AXTarget {
         guard !roots.isEmpty else { throw Failure("AX_UNAVAILABLE", "No accessible window for this process.") }
         for root in roots {
             try checkElement(root, policy)
-            let subrole = stringAttr(root, kAXSubroleAttribute)
+            let subrole = try policyAttribute(root, kAXSubroleAttribute) as? String
             if subrole == kAXSystemDialogSubrole { throw Failure("SENSITIVE_TARGET", "Protected system dialog.") }
-            if subrole == kAXDialogSubrole || attr(root, kAXModalAttribute) as? Bool == true {
+            let modal = try policyAttribute(root, kAXModalAttribute) as? Bool
+            if subrole == kAXDialogSubrole || modal == true {
                 try checkDialog(root, policy)
             } else {
-                for sheet in elements(root, kAXChildrenAttribute) where stringAttr(sheet, kAXRoleAttribute) == kAXSheetRole {
-                    try checkDialog(sheet, policy)
+                for child in try policyAttribute(root, kAXChildrenAttribute) as? [AXUIElement] ?? [] {
+                    guard let role = try policyAttribute(child, kAXRoleAttribute) as? String, !role.isEmpty else {
+                        throw Failure("AX_UNAVAILABLE", "Cannot identify window child.")
+                    }
+                    if role == kAXSheetRole { try checkDialog(child, policy) }
                 }
             }
         }
-    }
-    static func optional(_ pid: pid_t, _ policy: Guardrails) throws -> AXTarget? {
-        do { return try AXTarget(pid, policy) }
-        catch let e as Failure where e.code == "AX_UNAVAILABLE" { return nil }
     }
     func resolve(_ path: [Int]) throws -> AXUIElement {
         guard let first = path.first, roots.indices.contains(first) else {
@@ -355,7 +376,18 @@ func capture(_ opt: Options, _ policy: Guardrails) async throws -> Object {
     guard let window = content.windows.first(where: { $0.windowID == id }), let owner = window.owningApplication,
           owner.processID == record.pid else { throw Failure("WINDOW_UNAVAILABLE", "Window closed or unavailable to ScreenCaptureKit.") }
     try policy.check(owner.applicationName, owner.bundleIdentifier, window.title ?? "")
-    if AXIsProcessTrusted() { _ = try AXTarget.optional(record.pid, policy) }
+    func verifyCaptureTarget() throws {
+        let ax = try AXTarget(record.pid, policy)
+        let target = SessionTarget(ax: ax, owned: try processWindows(record.pid, policy), windowID: id)
+        let live = try target.window()
+        guard live.bounds == record.bounds,
+              let root = ax.roots.first(where: {
+                  axRect(attr($0, kAXPositionAttribute), attr($0, kAXSizeAttribute)) == live.bounds &&
+                      (try? target.check($0, in: live)) != nil
+              }) else { throw Failure("STALE_WINDOW", "Cannot verify capture window.") }
+        try checkDialog(root, policy)
+    }
+    try verifyCaptureTarget()
     let filter = SCContentFilter(desktopIndependentWindow: window)
     let size = filter.contentRect.size, scale = CGFloat(filter.pointPixelScale)
     guard size.width > 0, size.height > 0, scale > 0 else { throw Failure("IMAGE_ERROR", "Window has no capture area.") }
@@ -368,6 +400,7 @@ func capture(_ opt: Options, _ policy: Guardrails) async throws -> Object {
     config.ignoreShadowsSingleWindow = true; config.ignoreGlobalClipSingleWindow = true; config.showsCursor = false
     if #available(macOS 14.2, *) { config.includeChildWindows = false }
     var image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+    try verifyCaptureTarget()
     let geometry = CaptureGeometry(crop: crop, width: image.width, height: image.height, window: window.frame.size)
     image = try geometry.clip(image)
     if let grid { image = try drawGrid(image, grid) }
@@ -407,12 +440,12 @@ func postEvents(_ opt: Options, _ pid: pid_t, _ policy: Guardrails) async throws
     try requireAX()
     guard CGPreflightPostEventAccess() else { throw Failure("EVENT_PERMISSION", guide) }
     let owned = try processWindows(pid, policy)
-    let target = try AXTarget.optional(pid, policy)
     guard let source = CGEventSource(stateID: .privateState) else { throw Failure("EVENT_ERROR", "Cannot create event source.") }
     var result: Object = ["pid": pid, "mode": deliveryMode, "delivery": "posted_unverified",
         "guidance": "Read back the UI. If ignored use ax-press / ax-set-value, or an already authorized browser CDP session."]
     if key {
-        guard let target, let focused = element(target.app, kAXFocusedUIElementAttribute),
+        let target = try AXTarget(pid, policy)
+        guard let focused = element(target.app, kAXFocusedUIElementAttribute),
               let focusedWindow = element(target.app, kAXFocusedWindowAttribute),
               target.roots.contains(where: { CFEqual($0, focusedWindow) }) else {
             throw Failure("NO_FOCUSED_CONTROL", "Target app has no identifiable focused control/window. Use ax-set-value.")
@@ -446,12 +479,6 @@ func postEvents(_ opt: Options, _ pid: pid_t, _ policy: Guardrails) async throws
         }
         guard x < w.bounds.width, y < w.bounds.height else { throw Failure("OUT_OF_BOUNDS", "Use window-local points inside its bounds.") }
         let p = CGPoint(x: w.bounds.minX + x, y: w.bounds.minY + y)
-        if let target {
-            var hit: AXUIElement?
-            if AXUIElementCopyElementAtPosition(target.app, Float(p.x), Float(p.y), &hit) == .success, let hit {
-                try checkElement(hit, policy)
-            }
-        }
         func post(_ event: CGEvent) {
             event.flags = []
             event.location = p
@@ -460,6 +487,9 @@ func postEvents(_ opt: Options, _ pid: pid_t, _ policy: Guardrails) async throws
             event.postToPid(pid)
         }
         return try await guardWrite(pid, policy, opt) {
+            let live = SessionTarget(ax: try AXTarget(pid, policy), owned: try processWindows(pid, policy), windowID: w.id)
+            guard try live.window().bounds == w.bounds else { throw Failure("STALE_WINDOW", "Window moved.") }
+            _ = try live.hit(CGPoint(x: x, y: y), in: w, expected: nil)
             if scroll {
                 guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 1, wheel1: Int32(dy), wheel2: 0, wheel3: 0)
                 else { throw Failure("EVENT_ERROR", "Cannot construct scroll event.") }
@@ -550,7 +580,21 @@ struct MacGhostHelper {
                 try await runSession(pid: opt.pid(), policyLoader: Guardrails.load)
                 return
             }
-            response = try await run(args)
+            if args == ["--stdin-args"] {
+                var data = Data()
+                while let chunk = try FileHandle.standardInput.read(upToCount: 65536), !chunk.isEmpty {
+                    guard data.count + chunk.count <= 1024 * 1024 else {
+                        throw Failure("INVALID_ARGUMENT", "Argument payload too large.")
+                    }
+                    data.append(chunk)
+                }
+                guard let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+                    throw Failure("INVALID_ARGUMENT", "Expected a JSON argument array.")
+                }
+                response = try await run(decoded)
+            } else {
+                response = try await run(args)
+            }
             response["ok"] = true
         }
         catch {

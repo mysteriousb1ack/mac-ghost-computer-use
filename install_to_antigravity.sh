@@ -20,7 +20,7 @@ catch (e) {
   process.exit(1);
 }
 try {
-  for (const item of ['bin', 'src', 'skills', 'assets', 'README.md', 'LICENSE']) {
+  for (const item of ['bin', 'src', 'skills', 'assets', 'README.md', 'README_ZH.md', 'LICENSE']) {
     await cp(item, join(dest, item), { recursive: true, errorOnExist: true, force: false });
   }
   const config = JSON.parse(await readFile('mcp_config.json', 'utf8'));

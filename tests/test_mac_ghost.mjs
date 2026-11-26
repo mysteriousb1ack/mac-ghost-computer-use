@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { crc32, inflateSync } from 'node:zlib';
 import { createInterface } from 'node:readline';
-import { chmod, mkdir, mkdtemp, readFile, writeFile, rm, readdir, stat } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, writeFile, rm, readdir, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -243,7 +243,7 @@ test('grid capture sends native flags, embeds PNG and scale, and removes its pri
     index += n + 12;
   }
   assert.deepEqual([...inflateSync(Buffer.concat(compressed))], [0, 30, 80, 120]);
-  const [, capture] = await trace(ctx);
+  const capture = (await trace(ctx)).find(([name]) => name === 'capture');
   assert.deepEqual(capture.slice(0, -1), ['capture', '--window-id', '42', '--grid', '6x4', '--max-width', '960', '--out']);
   assert.ok(capture.at(-1).startsWith(join(ctx.dir, 'capture-')));
   assert.ok(!(await readdir(ctx.dir)).some(s => s.startsWith('capture-')));
@@ -363,7 +363,7 @@ test('changed focus, explicit restore, error details and safe audit log cross JS
   const replies = await calls(ctx, attempts.map(([name, args], i) => call(i + 2, name, { ...args, restore_focus: true })));
   assert.equal(errCode(replies[1]), 'AX_PERMISSION');
   for (const reply of replies) assert.deepEqual(payload(reply).focusAudit, focusAudit);
-  const commands = (await trace(ctx)).filter(([name]) => name !== 'windows');
+  const commands = (await trace(ctx)).filter(([name]) => !['windows', 'permissions'].includes(name));
   assert.ok(commands.every(args => args.at(-1) === '--restore-focus'));
   const audit = await readFile(join(ctx.dir, 'audit.jsonl'), 'utf8');
   assert.match(audit, /"focus_changed"/);
@@ -382,7 +382,7 @@ test('save_path returns metadata only; inline crop retains the PNG image block',
   assert.equal((await stat(meta.savedPath)).mode & 0o777, 0o600);
   assert.equal((await readFile(meta.savedPath)).readUInt32BE(0), 0x89504e47);
   assert.equal(replies[1].result.content[1].type, 'image');
-  assert.deepEqual((await trace(ctx))[1], ['capture', '--window-id', '42', '--grid', '1x1', '--crop', JSON.stringify(crop), '--save-path', '截图.png']);
+  assert.deepEqual((await trace(ctx)).find(([name]) => name === 'capture'), ['capture', '--window-id', '42', '--grid', '1x1', '--crop', JSON.stringify(crop), '--save-path', '截图.png']);
 });
 
 test('nested schema, ranges, safe path and boolean constraints reject calls before inspection', async () => {
@@ -407,6 +407,10 @@ test('installer dry-run, fresh install and backed-up upgrade in an isolated plug
   assert.equal(JSON.parse(success('/bin/sh', [...script, '--dry-run'])).operation, 'install');
   assert.deepEqual(await readdir(dir), []);
   assert.equal(JSON.parse(success('/bin/sh', script)).backup, null);
+  const chinese = await readFile(join(root, 'README_ZH.md'));
+  assert.deepEqual(await readFile(join(dest, 'README_ZH.md')), chinese);
+  success('/bin/sh', ['./install_to_antigravity.sh'], { env: { ...process.env, HOME: dir } });
+  assert.deepEqual(await readFile(join(dir, '.gemini/config/plugins/mac-ghost-computer-use/README_ZH.md')), chinese);
   const old = JSON.parse(await readFile(join(dest, 'plugin.json'), 'utf8'));
   old.version = '1.0.0';
   await writeFile(join(dest, 'plugin.json'), JSON.stringify(old));
@@ -418,7 +422,7 @@ test('installer dry-run, fresh install and backed-up upgrade in an isolated plug
   assert.deepEqual(JSON.parse(await readFile(join(dest, 'plugin.json'))), old);
   const { backup } = JSON.parse(success('/bin/sh', script));
   assert.deepEqual(JSON.parse(await readFile(join(backup, 'plugin.json'))), old);
-  assert.equal(JSON.parse(await readFile(join(dest, 'plugin.json'))).version, '2.0.0');
+  assert.equal(JSON.parse(await readFile(join(dest, 'plugin.json'))).version, '2.0.1');
   for (const path of [dest, backup]) assert.equal(await readFile(join(path, '.local/audit.jsonl'), 'utf8'), 'prior history\n');
   const installed = join(dest, 'bin/mac-ghost-helper');
   assert.ok(JSON.parse(success(installed, ['--help'])).commands['find-controls']);
@@ -570,4 +574,107 @@ test('real production helper session handles invalid JSON, unknown op, and close
   assert.equal(lines[2].id, '2');
   assert.equal(lines[2].ok, true);
   assert.equal(lines[2].closed, true);
+});
+
+const target = { pid: 77, window_id: 42, snapshot: 'snap-1' };
+const dragStep = { op: 'drag', from_x: 1, from_y: 1, to_x: 4, to_y: 4, allow_activate: true };
+const pasteStep = { op: 'paste', text: 'body' };
+
+for (const [label, step, receipt, code, effect] of [
+  ['unsent paste', pasteStep, { posted: false, pasteEffect: 'not_sent', code: 'CLIPBOARD_CHANGED',
+    clipboardRestore: 'changed_externally' }, 'CLIPBOARD_CHANGED', 'not_started'],
+  ['partial drag', dragStep, { partial: true, mouseUpPosted: true, code: 'STALE_WINDOW' }, 'STALE_WINDOW', 'partial'],
+  ['unreleased drag', dragStep, { partial: false, mouseUpPosted: false }, 'INCOMPLETE_ACTION', 'partial'],
+  ['failed clipboard restoration', pasteStep, { posted: true, clipboardRestore: 'restore_failed' },
+    'CLIPBOARD_RESTORE_FAILED', 'unknown'],
+]) {
+  test(label + ' preserves receipt and stops before next key', async () => {
+    const ctx = await context({ receipt: { [step.op]: receipt } });
+    const [reply] = await calls(ctx, [call(2, 'run_actions', { ...target, steps: [step, { op: 'press_key', key: 'Return' }] })]);
+    assert.equal(errCode(reply), code);
+    const result = payload(reply);
+    assert.equal(result.ok, false);
+    assert.equal(result.completed, 0);
+    assert.equal(result.failed_index, 0);
+    assert.equal(result.effect, effect);
+    for (const [key, value] of Object.entries(receipt)) assert.equal(result.receipts[0][key], value);
+    assert.ok(!(await trace(ctx)).some(([op]) => op === 'session:press_key'));
+  });
+}
+
+test('activated drag exempts only verified target PID and window at both focus samples', async () => {
+  const front = (pid, windowId) => ({ pid, activeWindow: { status: 'focused', windowId } });
+  const wanted = front(77, 42);
+  for (const [immediate, after, accepted] of [
+    [wanted, wanted, true], [wanted, front(88, 42), false], [wanted, front(77, 43), false],
+    [front(88, 42), wanted, false], [wanted, front(77, null), false],
+  ]) {
+    const ctx = await context({ stepFocusAudit: { drag: { status: 'changed', focusPreserved: false,
+      beforeFrontmost: front(9, 1), immediateFrontmost: immediate, afterFrontmost: after } } });
+    const [reply] = await calls(ctx, [call(2, 'run_actions', { ...target, steps: [dragStep, { op: 'press_key', key: 'Return' }] })]);
+    assert.equal(payload(reply).completed, accepted ? 2 : 0);
+    if (!accepted) assert.equal(errCode(reply), 'FOCUS_CHANGED');
+    assert.equal((await trace(ctx)).some(([op]) => op === 'session:press_key'), accepted);
+  }
+});
+
+test('activated drag ending in the original unrelated app cannot claim preserved focus as success', async () => {
+  const ctx = await context();
+  const [reply] = await calls(ctx, [call(2, 'run_actions', { ...target, steps: [dragStep] })]);
+  assert.equal(errCode(reply), 'FOCUS_CHANGED');
+  assert.equal(payload(reply).completed, 0);
+});
+
+test('missing AX trust blocks legacy pointer and capture but permits discovery', async () => {
+  const ctx = await context({ permissions: { accessibility: false } });
+  const replies = await calls(ctx, [call(2, 'list_windows'), call(3, 'bg_click', { pid: 77, x: 1, y: 2 }),
+    call(4, 'bg_type_or_scroll', { pid: 77, mode: 'scroll', x: 1, y: 2, dy: 3 }),
+    call(5, 'capture_window', { window_id: 42 })]);
+  assert.deepEqual(payload(replies[0]).windows, [sample]);
+  assert.deepEqual(replies.slice(1).map(errCode), Array(3).fill('AX_PERMISSION'));
+  assert.ok((await trace(ctx)).every(([op]) => ['windows', 'permissions'].includes(op)));
+});
+
+test('legacy batch enforces count, aggregate response bytes and absolute deadline', async () => {
+  const messages = [rpc(2, 'ping'), rpc(3, 'tools/list'), call(4, 'check_permissions')];
+  const run = async (ctx, batch) => (await exchange(ctx, [init('2025-03-26'), ready, batch])).at(-1).msg;
+  const ctx = await context({}, { maxBatchItems: 2 });
+  assert.equal((await run(ctx, messages)).error.code, -32600);
+  const small = await context({}, { maxBatchBytes: 800 });
+  const replies = await run(small, messages);
+  assert.ok(Buffer.byteLength(JSON.stringify(replies)) <= 800);
+  assert.deepEqual(replies.map(r => r.error?.code ?? 0), [0, -32000, -32000]);
+  assert.ok(!(await readdir(small.dir)).includes('calls.jsonl'));
+  const slow = await context({ failureCommand: 'permissions', failure: 'hang' }, { maxBatchMs: 150 });
+  const timed = await run(slow, [call(2, 'check_permissions'), call(3, 'list_windows')]);
+  assert.equal(timed.at(-1).error.code, -32000);
+  assert.ok(!(await trace(slow)).some(([op]) => op === 'windows'));
+});
+
+test('legacy MCP bodies travel only via stdin and the native CLI decodes the same arguments', async () => {
+  const ctx = await context();
+  const sentinel = 'private-正文🙂';
+  const [reply] = await calls(ctx, [call(2, 'ax_set_value', { pid: 77, path: '0', value: sentinel })]);
+  assert.equal(payload(reply).delivery, 'ax_success');
+  assert.deepEqual(JSON.parse(await readFile(join(ctx.dir, 'transport.jsonl'), 'utf8')), ['--stdin-args']);
+  const args = ['bg-key', '--pid', '77', '--text', sentinel + '\n'];
+  const secure = command(helper, ['--stdin-args'], { input: JSON.stringify(args) });
+  assert.equal(secure.status, 1);
+  assert.deepEqual(JSON.parse(secure.stdout), native(args, 1));
+});
+
+test('default SwiftPM caches are distinct for two checkout paths', async () => {
+  const dir = await mkdtemp(join(scratch, 'build-cache-'));
+  const env = { ...process.env, HOME: dir };
+  delete env.MACGHOST_BUILD_DIR;
+  for (const name of ['checkout-a', 'checkout-b']) {
+    const checkout = join(dir, name);
+    await mkdir(checkout);
+    await copyFile(join(root, 'build.sh'), join(checkout, 'build.sh'));
+    const result = command('/bin/sh', ['build.sh', 'invalid'], { cwd: checkout, env });
+    assert.equal(result.status, 2); // Select the scratch path without compiling.
+  }
+  const hashes = await readdir(join(dir, 'Library/Caches/mac-ghost-build'));
+  assert.equal(hashes.length, 2);
+  for (const hash of hashes) assert.match(hash, /^[0-9a-f]{64}$/);
 });

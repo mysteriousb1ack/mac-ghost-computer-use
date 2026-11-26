@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { constants } from 'node:fs';
@@ -65,14 +66,25 @@ export function createRunner({
     requestTimeoutMs: Math.min(timeout, 15000),
   });
 
+  const batchDeadline = new AsyncLocalStorage();
+  function timeLeft(ms) {
+    const limit = Math.min(ms, Math.floor((batchDeadline.getStore() ?? Infinity) - performance.now()));
+    if (limit <= 0) throw new Problem('TIMEOUT', 'Batch deadline reached.');
+    return limit;
+  }
+
   async function invoke(args, callTimeout = timeout) {
     let output;
     try {
-      output = (await run(helper, [...prefix, ...args], {
-        timeout: callTimeout,
+      const stdinArgs = args.some(arg => ['--value', '--text', '--window-title', '--title-contains', '--value-contains'].includes(arg));
+      const execution = run(helper, [...prefix, ...(stdinArgs ? ['--stdin-args'] : args)], {
+        timeout: timeLeft(callTimeout),
         killSignal: 'SIGKILL',
         maxBuffer: 16 * 1024 * 1024,
-      })).stdout;
+      });
+      execution.child.stdin.on('error', () => {}); // Early helper exit is handled by execFile.
+      execution.child.stdin.end(stdinArgs ? JSON.stringify(args) : undefined);
+      output = (await execution).stdout;
     } catch (error) {
       if (error.killed || error.signal || typeof error.code !== 'number') {
         throw new Problem('HELPER_FAILED', 'Helper unavailable, terminated or timed out. Read back state before retrying.');
@@ -151,6 +163,11 @@ export function createRunner({
       return diagnoseUnavailable(name, new Problem('TARGET_UNAVAILABLE', 'Cannot identify target.'), callTimeout);
     }
     if (owned.some(sensitive)) throw new Problem('SENSITIVE_TARGET', 'Protected process or window.');
+    if (['bg_click', 'bg_type_or_scroll', 'capture_window'].includes(name)) {
+      const permissions = await invoke(['permissions'], callTimeout);
+      if (permissions.accessibility !== true) throw new Problem('AX_PERMISSION', 'Accessibility is required to verify the target.');
+      if (name === 'capture_window' && permissions.screenRecording !== true) throw new Problem('SCREEN_PERMISSION', permissions.guidance);
+    }
     return { ok: true, owned, window };
   }
 
@@ -223,7 +240,7 @@ export function createRunner({
   }
 
   const sessionDeps = {
-    pool,
+    pool: { request: (pid, op, params, ms) => pool.request(pid, op, params, timeLeft(ms)) },
     preflightTarget: (opName, target, ms) => preflightTarget(opName, target, ms),
     auditStep: (opName, status) => audit(`step:${opName}`, status),
   };
@@ -303,6 +320,7 @@ export function createRunner({
     }
   }
 
-  runner.close = () => pool.closeAll();
-  return runner;
+  const scopedRunner = (name, args, deadline) => batchDeadline.run(deadline, runner, name, args);
+  scopedRunner.close = () => pool.closeAll();
+  return scopedRunner;
 }

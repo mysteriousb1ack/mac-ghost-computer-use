@@ -170,6 +170,13 @@ func buildPasteItems(text: String, format: String) throws -> [[NSPasteboard.Past
             throw Failure("PASTE_CONVERSION_FAILED", "Cannot convert Markdown representations.")
         }
     case "html":
+        // Only attribute-free formatting tags reach AppKit or the receiving app.
+        // This also excludes relative URLs, CSS, entities in attributes and SVG.
+        let tags = #"(?i)</?(?:p|div|span|b|strong|i|em|u|s|del|pre|code|blockquote|ul|ol|li|h[1-6]|br)\s*/?>"#
+        let remaining = text.replacingOccurrences(of: tags, with: "", options: .regularExpression)
+        guard !remaining.contains("<") else {
+            throw Failure("UNSAFE_HTML", "Use formatting tags without attributes or external resources.")
+        }
         rich = try importPasteHTML(source)
         item[.html] = source
         item[.string] = Data(rich.string.utf8)
@@ -260,7 +267,7 @@ func performPasteTransaction(
                 "clipboardRestore": "changed_externally", "code": "CLIPBOARD_CHANGED"]
     } catch PasteboardMutationError.publishFailed(let generation) {
         let restore = restoreSnapshot(original, board: board, expected: generation)
-        throw Failure("CLIPBOARD_WRITE_FAILED", "Pasteboard publish failed. Restore: \(restore).")
+        return ["posted": false, "pasteEffect": "not_sent", "clipboardRestore": restore, "code": "CLIPBOARD_WRITE_FAILED"]
     } catch {
         throw Failure("CLIPBOARD_WRITE_FAILED", "Cannot prepare pasteboard representations.")
     }
@@ -273,7 +280,7 @@ func performPasteTransaction(
         try Task.checkCancellation()
     } catch {
         let restore = restoreSnapshot(original, board: board, expected: installed)
-        throw Failure("CANCELLED", "Paste cancelled before delivery. Restore: \(restore).")
+        return ["posted": false, "pasteEffect": "not_sent", "clipboardRestore": restore, "code": "CANCELLED"]
     }
 
     do {
@@ -284,17 +291,14 @@ func performPasteTransaction(
         // interval before restoring, and never expose the sender's error text.
         await settleWait()
         let restore = restoreSnapshot(original, board: board, expected: installed)
-        if restore == "changed_externally" {
-            return ["posted": null, "pasteEffect": "unknown",
-                    "clipboardRestore": restore, "code": "PASTE_SEND_FAILED"]
-        }
-        throw Failure("PASTE_SEND_FAILED", "Command-V delivery failed. Restore: \(restore).")
+        return ["posted": null, "pasteEffect": "unknown",
+                "clipboardRestore": restore, "code": "PASTE_SEND_FAILED"]
     }
 
     await settleWait()
     let restore = restoreSnapshot(original, board: board, expected: installed)
     var receipt: Object = [
-        "posted": true, "pasteEffect": "unverified", "clipboardRestore": restore
+        "posted": true, "delivery": "posted_unverified", "pasteEffect": "unverified", "clipboardRestore": restore
     ]
     if restore == "changed_externally" { receipt["code"] = "CLIPBOARD_CHANGED" }
     if restore == "restore_failed" { receipt["code"] = "CLIPBOARD_RESTORE_FAILED" }

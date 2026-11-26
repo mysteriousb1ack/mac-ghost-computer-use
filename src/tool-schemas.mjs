@@ -153,7 +153,7 @@ const atomic = [
   ],
   [
     'paste',
-    'Paste plain text, Markdown or HTML via multi-format clipboard with automatic restore of prior clipboard contents.',
+    'Paste plain text, Markdown or HTML via multi-format clipboard with external-change detection and best-effort clipboard restoration.',
     { ref, text: text(), format: { enum: ['text', 'md', 'html'], default: 'text' } },
     ['text'],
   ],
@@ -165,7 +165,7 @@ const atomic = [
   ],
   [
     'drag',
-    'Smoothly drag between two window-local points or along a multi-point path (points); supports opt-in allow_activate for PencilKit/canvas gestures and always releases mouse button on interruption.',
+    'Smoothly drag between two window-local points or along a multi-point path (points); supports opt-in allow_activate for PencilKit/canvas gestures and reports partial movement and mouse-up posting on interruption.',
     {
       from_x: point,
       from_y: point,

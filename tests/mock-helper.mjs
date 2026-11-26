@@ -2,7 +2,13 @@ import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { basename, join } from 'node:path';
 
-const [dir, command, ...args] = process.argv.slice(2);
+let [dir, command, ...args] = process.argv.slice(2);
+if (command === '--stdin-args') {
+  await appendFile(join(dir, 'transport.jsonl'), JSON.stringify(process.argv.slice(3)) + '\n');
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  [command, ...args] = JSON.parse(Buffer.concat(chunks));
+}
 const fixture = JSON.parse(await readFile(join(dir, 'fixture.json'), 'utf8'));
 await appendFile(join(dir, 'calls.jsonl'), JSON.stringify([command, ...args]) + '\n');
 const flag = name => args[args.indexOf(name) + 1];
@@ -91,7 +97,7 @@ if (command === 'session') {
       fixture.sessionAfterWriteNodes = [currentNodes[1]];
     }
     const stepAudit = fixture.stepFocusAudit?.[req.op] ?? focusAudit;
-    reply({ ok: true, delivery: 'ax_success', focusAudit: stepAudit });
+    reply({ ok: true, delivery: 'ax_success', focusAudit: stepAudit, ...fixture.receipt?.[req.op] });
   }
   process.exit(0);
 }
