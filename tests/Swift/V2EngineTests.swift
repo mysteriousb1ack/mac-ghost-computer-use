@@ -163,12 +163,35 @@ final class V2EngineTests: XCTestCase {
     }
 
     func testAXTransportFailureIsNotAnAbsentAttribute() throws {
-        for status: AXError in [.cannotComplete, .apiDisabled, .invalidUIElement] {
+        for status: AXError in [.cannotComplete, .apiDisabled, .invalidUIElement, .illegalArgument] {
+            XCTAssertThrowsError(try verifiedAXValue(status, nil, optional: true, roleVerified: true)) {
+                XCTAssertEqual(($0 as? Failure)?.code, "AX_UNAVAILABLE")
+            }
             XCTAssertThrowsError(try verifiedAXValue(status, nil)) {
                 XCTAssertEqual(($0 as? Failure)?.code, "AX_UNAVAILABLE")
             }
         }
         XCTAssertNil(try verifiedAXValue(.attributeUnsupported, nil))
+    }
+
+    func testOptionalAXMetadataOnNativeControls() throws {
+        for status: AXError in [.attributeUnsupported, .noValue, .notImplemented] {
+            XCTAssertNil(try verifiedAXValue(status, nil, optional: true))
+        }
+        XCTAssertNil(try verifiedAXValue(.failure, nil, optional: true, roleVerified: true))
+        XCTAssertThrowsError(try verifiedAXValue(.failure, nil, optional: true, roleVerified: false))
+        for status: AXError in [.failure, .notImplemented] {
+            XCTAssertThrowsError(try verifiedAXValue(status, nil, roleVerified: true))
+        }
+        let secure = kAXSecureTextFieldSubrole as CFString
+        XCTAssertEqual(try verifiedAXValue(.success, secure, optional: true) as? String, secure as String)
+    }
+
+    func testFullDialogScanIsLimitedToDialogWindowsAndSheets() {
+        XCTAssertFalse(requiresDialogScan(role: kAXWindowRole, subrole: kAXStandardWindowSubrole, modal: false))
+        XCTAssertTrue(requiresDialogScan(role: kAXWindowRole, subrole: kAXDialogSubrole, modal: nil))
+        XCTAssertTrue(requiresDialogScan(role: kAXWindowRole, subrole: nil, modal: true))
+        XCTAssertTrue(requiresDialogScan(role: kAXSheetRole, subrole: nil, modal: false))
     }
 
     @MainActor

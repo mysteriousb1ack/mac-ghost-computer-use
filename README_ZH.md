@@ -12,7 +12,7 @@
 
 **Google Antigravity** 自带很强的代码、终端和浏览器代理能力，但**目前并没有原生桌面级 Computer Use**，没法直接操作你 Mac 上的本地客户端软件（如 Finder、WPS/Office、MarginNote、Keynote、本地专业软件等）。而市面常见的截图型桌面操控方案每操作一步都要截一张整屏高清图，既狂烧图像 Token、容易打穿上下文缓存，又老抢占前台窗口。
 
-**MacGhost v2.0.1** 专为 Google Antigravity 补齐这块原生桌面操控拼图，同时遵循标准 MCP 协议（Claude Desktop / Cursor / Codex 均可直连），完全基于 Apple 原生框架（`Accessibility`、`ScreenCaptureKit`、`CoreGraphics`）与 Node.js 22 标准库从零编写：
+**MacGhost v2.0.2** 专为 Google Antigravity 补齐这块原生桌面操控拼图，同时遵循标准 MCP 协议（Claude Desktop / Cursor / Codex 均可直连），完全基于 Apple 原生框架（`Accessibility`、`ScreenCaptureKit`、`CoreGraphics`）与 Node.js 22 标准库从零编写：
 
 - **默认纯文本无图流**：`get_state` 读取紧凑 AX 控件树并分配稳定引用 `e<id>`，后续调用默认只返回相对上一帧的增量 Diff（`remove_ranges` + `upsert`），常规办公和桌面操作零图片传输。仅在画布或缺少 AX 标签时才按需用 `capture_window`（支持归一化裁剪和 `6×4` 网格坐标）。
 - **单次 32 步批量连招**：`run_actions` 一次 MCP 调用即可串行执行最多 32 个步骤（支持点击、按键、富文本粘贴、选词、拖拽、等待、控件状态断言），遇到界面过期（`STALE_FRAME`）或焦点漂移自动停止不盲点。

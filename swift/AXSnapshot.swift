@@ -33,18 +33,6 @@ func enableAccessibility(_ app: AXUIElement) -> Object {
     return report
 }
 
-private func snapshotRead(_ element: AXUIElement, _ key: String) throws -> CFTypeRef? {
-    var value: CFTypeRef?
-    switch AXUIElementCopyAttributeValue(element, key as CFString, &value) {
-    case .success:
-        return value
-    case .noValue, .attributeUnsupported:
-        return nil
-    default:
-        throw Failure("AX_READ_FAILED", "Could not inspect \(key).")
-    }
-}
-
 private struct SnapshotIdentity {
     let root: AXUIElement
     let element: AXUIElement
@@ -157,12 +145,13 @@ private func snapshotRoots(_ target: AXTarget, _ windowID: CGWindowID?) throws
     let sameBoundsWindows = owned.filter { $0.layer == requested.layer && $0.bounds == requested.bounds }
     var byBounds = [(Int, AXUIElement, String)]()
     for (index, root) in roots {
-        guard let box = axRect(try snapshotRead(root, kAXPositionAttribute),
-                               try snapshotRead(root, kAXSizeAttribute)) else {
+        guard let box = axRect(try policyAttribute(root, kAXPositionAttribute),
+                               try policyAttribute(root, kAXSizeAttribute)) else {
             throw stale
         }
         if box == requested.bounds {
-            let title = try snapshotRead(root, kAXTitleAttribute) as? String ?? ""
+            let role = try requiredRole(root)
+            let title = try policyAttribute(root, kAXTitleAttribute, optional: true, verifiedRole: role) as? String ?? ""
             byBounds.append((index, root, title))
         }
     }
@@ -209,12 +198,13 @@ func captureCompactFrame(target: AXTarget, windowID: CGWindowID?,
             return
         }
 
+        var verifiedRole: String?
         func read(_ key: String) throws -> CFTypeRef? {
             guard clock.now < deadline else {
                 truncated = true
                 throw Failure("CAPTURE_TIMEOUT", "Capture deadline reached.")
             }
-            return try snapshotRead(item, key)
+            return try policyAttribute(item, key, optional: key != kAXRoleAttribute, verifiedRole: verifiedRole)
         }
         func label(_ key: String) throws -> String? {
             guard let raw = try read(key) as? String, !raw.isEmpty else { return nil }
@@ -223,14 +213,16 @@ func captureCompactFrame(target: AXTarget, windowID: CGWindowID?,
 
         var descendantParent = parent
         do {
-            let role = try label(kAXRoleAttribute) ?? ""
+            guard let role = try label(kAXRoleAttribute) else {
+                throw Failure("AX_UNAVAILABLE", "Cannot inspect control role.")
+            }
+            verifiedRole = role
             let subrole = try label(kAXSubroleAttribute) ?? ""
             let title = try label(kAXTitleAttribute)
             let detail = try label(kAXDescriptionAttribute)
             let blocked = target.policy.protectedControl(
                 role: role, subrole: subrole, title: title ?? "", description: detail ?? ""
             )
-            if role.isEmpty { failed = true }
             let identifier = blocked ? nil : try label("AXIdentifier")
             var value: String?
             var enabled: Bool?
@@ -246,13 +238,10 @@ func captureCompactFrame(target: AXTarget, windowID: CGWindowID?,
                 focused = try read(kAXFocusedAttribute) as? Bool
                 selected = try read(kAXSelectedAttribute) as? Bool
                 var actionNames: CFArray?
-                switch AXUIElementCopyActionNames(item, &actionNames) {
-                case .success:
-                    names = (actionNames as? [String] ?? []).sorted()
-                case .actionUnsupported, .noValue:
-                    break
-                default:
-                    failed = true
+                let status = AXUIElementCopyActionNames(item, &actionNames)
+                if status != .actionUnsupported {
+                    let raw = try verifiedAXValue(status, actionNames, optional: true, roleVerified: true)
+                    names = (raw as? [String] ?? []).sorted()
                 }
                 box = axRect(try read(kAXPositionAttribute), try read(kAXSizeAttribute))
             }
@@ -282,7 +271,7 @@ func captureCompactFrame(target: AXTarget, windowID: CGWindowID?,
                 descendantParent = ref
             }
             if blocked { return }
-        } catch let error as Failure where error.code == "ID_EXHAUSTED" {
+        } catch let error as Failure where ["ID_EXHAUSTED", "AX_UNAVAILABLE"].contains(error.code) {
             throw error
         } catch {
             failed = true
@@ -291,12 +280,9 @@ func captureCompactFrame(target: AXTarget, windowID: CGWindowID?,
 
         var count: CFIndex = 0
         let key = kAXChildrenAttribute as CFString
-        switch AXUIElementGetAttributeValueCount(item, key, &count) {
-        case .attributeUnsupported, .noValue: return
-        case .success: break
-        default: failed = true; return
-        }
-        guard count > 0 else { return }
+        let countStatus = AXUIElementGetAttributeValueCount(item, key, &count)
+        _ = try verifiedAXValue(countStatus, nil)
+        guard countStatus == .success, count > 0 else { return }
         guard ancestors.count < maxDepth else { truncated = true; return }
 
         var offset = 0
@@ -304,7 +290,9 @@ func captureCompactFrame(target: AXTarget, windowID: CGWindowID?,
             guard hasBudget() else { return }
             let length = min(32, count - offset, maxNodes - visited)
             var page: CFArray?
-            guard AXUIElementCopyAttributeValues(item, key, offset, length, &page) == .success,
+            let pageStatus = AXUIElementCopyAttributeValues(item, key, offset, length, &page)
+            _ = try verifiedAXValue(pageStatus, page)
+            guard pageStatus == .success,
                   let children = page as? [AXUIElement], children.count == length else {
                 failed = true
                 return

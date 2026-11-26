@@ -25,7 +25,7 @@ for (const file of files) await access(file);
 await access(files[0], constants.X_OK);
 const help = JSON.parse(execFileSync(resolve(files[0]), ['--help'], { encoding: 'utf8' }));
 const manifest = JSON.parse(await readFile('plugin.json', 'utf8'));
-if (manifest.name !== name || manifest.version !== '2.0.1' || !help.commands['find-controls'] || !help.commands['session']) throw new Error('Build the v2.0.1 release first.');
+if (manifest.name !== name || manifest.version !== '2.0.2' || !help.commands['find-controls'] || !help.commands['session']) throw new Error('Build the v2.0.2 release first.');
 const config = JSON.parse(await readFile('mcp_config.json', 'utf8'));
 config.mcpServers['mac-ghost'].command = process.execPath;
 

@@ -422,7 +422,7 @@ test('installer dry-run, fresh install and backed-up upgrade in an isolated plug
   assert.deepEqual(JSON.parse(await readFile(join(dest, 'plugin.json'))), old);
   const { backup } = JSON.parse(success('/bin/sh', script));
   assert.deepEqual(JSON.parse(await readFile(join(backup, 'plugin.json'))), old);
-  assert.equal(JSON.parse(await readFile(join(dest, 'plugin.json'))).version, '2.0.1');
+  assert.equal(JSON.parse(await readFile(join(dest, 'plugin.json'))).version, '2.0.2');
   for (const path of [dest, backup]) assert.equal(await readFile(join(path, '.local/audit.jsonl'), 'utf8'), 'prior history\n');
   const installed = join(dest, 'bin/mac-ghost-helper');
   assert.ok(JSON.parse(success(installed, ['--help'])).commands['find-controls']);
@@ -455,6 +455,13 @@ test('v2 get_state returns full text AX tree then incremental diff with zero ima
   const callsLog = await trace(ctx);
   assert.ok(!callsLog.some(c => c[0] === 'capture'));
   assert.equal(callsLog.filter(c => c[0] === 'session').length, 1, 'session should be reused for the same PID');
+});
+
+test('get_state propagates fatal native AX failures without returning a usable frame', async () => {
+  const ctx = await context({ failureCommand: 'get_state', failureCode: 'AX_UNAVAILABLE' });
+  const [reply] = await calls(ctx, [call(2, 'get_state', { pid: 77, window_id: 42 })]);
+  assert.equal(errCode(reply), 'AX_UNAVAILABLE');
+  assert.equal(payload(reply).state, undefined);
 });
 
 test('v2 run_actions stops on first failed assert, never dispatches subsequent Return, and redacts pasted body', async () => {

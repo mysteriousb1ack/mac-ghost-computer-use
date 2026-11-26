@@ -161,27 +161,43 @@ func actions(_ e: AXUIElement) -> [String] {
     guard AXUIElementCopyActionNames(e, &names) == .success else { return [] }
     return names as? [String] ?? []
 }
-func verifiedAXValue(_ status: AXError, _ value: CFTypeRef?) throws -> CFTypeRef? {
+func verifiedAXValue(_ status: AXError, _ value: CFTypeRef?, optional: Bool = false,
+                     roleVerified: Bool = false) throws -> CFTypeRef? {
     switch status {
     case .success: return value
     case .attributeUnsupported, .noValue: return nil
+    case .notImplemented where optional: return nil
+    case .failure where optional && roleVerified: return nil
     default: throw Failure("AX_UNAVAILABLE", "Cannot verify target accessibility attributes.")
     }
 }
 
-func policyAttribute(_ item: AXUIElement, _ key: String) throws -> CFTypeRef? {
+func policyAttribute(_ item: AXUIElement, _ key: String, optional: Bool = false,
+                     verifiedRole: String? = nil) throws -> CFTypeRef? {
     var value: CFTypeRef?
     let status = AXUIElementCopyAttributeValue(item, key as CFString, &value)
-    return try verifiedAXValue(status, value)
+    return try verifiedAXValue(status, value, optional: optional,
+                               roleVerified: verifiedRole?.isEmpty == false)
 }
 
-func checkElement(_ e: AXUIElement, _ policy: Guardrails) throws {
-    if try policyAttribute(e, kAXSubroleAttribute) as? String == kAXSecureTextFieldSubrole {
-        throw Failure("SENSITIVE_TARGET", "Protected input field.")
+func requiredRole(_ item: AXUIElement) throws -> String {
+    guard let role = try policyAttribute(item, kAXRoleAttribute) as? String, !role.isEmpty else {
+        throw Failure("AX_UNAVAILABLE", "Cannot inspect control role.")
+    }
+    return role
+}
+
+@discardableResult
+func checkElement(_ e: AXUIElement, _ policy: Guardrails, verifiedRole: String? = nil) throws -> String? {
+    let role = try verifiedRole ?? requiredRole(e)
+    let subrole = try policyAttribute(e, kAXSubroleAttribute, optional: true, verifiedRole: role) as? String
+    if subrole == kAXSecureTextFieldSubrole || subrole == kAXSystemDialogSubrole {
+        throw Failure("SENSITIVE_TARGET", "Protected input field or system dialog.")
     }
     for key in [kAXTitleAttribute, kAXDescriptionAttribute] {
-        try policy.check("", "", policyAttribute(e, key) as? String ?? "")
+        try policy.check("", "", policyAttribute(e, key, optional: true, verifiedRole: role) as? String ?? "")
     }
+    return subrole
 }
 
 // Read public dialog labels and secure-field subroles before acting on a sibling
@@ -190,9 +206,8 @@ func checkDialog(_ root: AXUIElement, _ policy: Guardrails) throws {
     var pending = [root], visited = 0
     while let item = pending.popLast() {
         visited += 1
-        let role = stringAttr(item, kAXRoleAttribute)
-        guard !role.isEmpty else { throw Failure("AX_UNAVAILABLE", "Cannot inspect control role.") }
-        try checkElement(item, policy)
+        let role = try requiredRole(item)
+        try checkElement(item, policy, verifiedRole: role)
         if role == kAXStaticTextRole {
             try policy.check("", "", policyAttribute(item, kAXValueAttribute) as? String ?? "")
         }
@@ -209,6 +224,33 @@ func checkDialog(_ root: AXUIElement, _ policy: Guardrails) throws {
     }
 }
 
+func requiresDialogScan(role: String, subrole: String?, modal: Bool?) -> Bool {
+    role == kAXSheetRole || subrole == kAXDialogSubrole || modal == true
+}
+
+func checkWindow(_ root: AXUIElement, _ policy: Guardrails) throws {
+    let role = try requiredRole(root)
+    let subrole = try checkElement(root, policy, verifiedRole: role)
+    let modal = try policyAttribute(root, kAXModalAttribute, optional: true, verifiedRole: role) as? Bool
+    if requiresDialogScan(role: role, subrole: subrole, modal: modal) {
+        try checkDialog(root, policy)
+        return
+    }
+    for child in try policyAttribute(root, kAXChildrenAttribute) as? [AXUIElement] ?? [] {
+        let childRole = try requiredRole(child)
+        if childRole == kAXSheetRole {
+            try checkDialog(child, policy)
+        } else if childRole == kAXWindowRole {
+            // Embedded dialog windows need the same checks as top-level windows.
+            let subrole = try checkElement(child, policy, verifiedRole: childRole)
+            let modal = try policyAttribute(child, kAXModalAttribute, optional: true, verifiedRole: childRole) as? Bool
+            if requiresDialogScan(role: childRole, subrole: subrole, modal: modal) {
+                try checkDialog(child, policy)
+            }
+        }
+    }
+}
+
 struct AXTarget {
     let app: AXUIElement, roots: [AXUIElement], policy: Guardrails
     init(_ pid: pid_t, _ policy: Guardrails, enableRichAX: Bool = false) throws {
@@ -219,22 +261,7 @@ struct AXTarget {
         if enableRichAX { _ = enableAccessibility(app) }
         roots = elements(app, kAXWindowsAttribute)
         guard !roots.isEmpty else { throw Failure("AX_UNAVAILABLE", "No accessible window for this process.") }
-        for root in roots {
-            try checkElement(root, policy)
-            let subrole = try policyAttribute(root, kAXSubroleAttribute) as? String
-            if subrole == kAXSystemDialogSubrole { throw Failure("SENSITIVE_TARGET", "Protected system dialog.") }
-            let modal = try policyAttribute(root, kAXModalAttribute) as? Bool
-            if subrole == kAXDialogSubrole || modal == true {
-                try checkDialog(root, policy)
-            } else {
-                for child in try policyAttribute(root, kAXChildrenAttribute) as? [AXUIElement] ?? [] {
-                    guard let role = try policyAttribute(child, kAXRoleAttribute) as? String, !role.isEmpty else {
-                        throw Failure("AX_UNAVAILABLE", "Cannot identify window child.")
-                    }
-                    if role == kAXSheetRole { try checkDialog(child, policy) }
-                }
-            }
-        }
+        for root in roots { try checkWindow(root, policy) }
     }
     func resolve(_ path: [Int]) throws -> AXUIElement {
         guard let first = path.first, roots.indices.contains(first) else {
@@ -385,7 +412,14 @@ func capture(_ opt: Options, _ policy: Guardrails) async throws -> Object {
                   axRect(attr($0, kAXPositionAttribute), attr($0, kAXSizeAttribute)) == live.bounds &&
                       (try? target.check($0, in: live)) != nil
               }) else { throw Failure("STALE_WINDOW", "Cannot verify capture window.") }
-        try checkDialog(root, policy)
+        try checkWindow(root, policy)
+        if let raw = try policyAttribute(ax.app, kAXFocusedUIElementAttribute) {
+            guard CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+                throw Failure("AX_UNAVAILABLE", "Cannot identify focused control.")
+            }
+            let focused = raw as! AXUIElement
+            try checkElement(focused, policy)
+        }
     }
     try verifyCaptureTarget()
     let filter = SCContentFilter(desktopIndependentWindow: window)
