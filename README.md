@@ -1,9 +1,10 @@
 # MacGhost Computer Use
 
-> **Native macOS Computer Use MCP Server — Text-Only AX Tree Diffs, 32-Step Action Batches, Focus Auditing, and Zero Dependencies.**
+> **The missing native macOS Computer Use plugin for Google Antigravity (and any MCP host) — Text-Only AX Tree Diffs, 32-Step Action Batches, Focus Auditing, and Zero Dependencies.**
 
+[![For Google Antigravity](https://img.shields.io/badge/Built%20for-Google%20Antigravity-0F766E?style=flat-square)](#quick-start)
 [![macOS 14+ Apple Silicon](https://img.shields.io/badge/macOS-14%2B%20Apple%20Silicon-111827?style=flat-square&logo=apple&logoColor=white)](#requirements)
-[![MCP Protocol](https://img.shields.io/badge/MCP-STDIO%202025--11--25-0F766E?style=flat-square)](#mcp-tools)
+[![MCP Protocol](https://img.shields.io/badge/MCP-STDIO%202025--11--25-0284C7?style=flat-square)](#mcp-tools)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-0%20npm%20%7C%200%20SwiftPM-1D4ED8?style=flat-square)](#architecture)
 [![License: MIT](https://img.shields.io/badge/License-MIT-374151?style=flat-square)](LICENSE)
 
@@ -15,9 +16,9 @@
 
 ## Why MacGhost?
 
-Most desktop Computer Use agents take a full-resolution screenshot on every turn, send megabytes of image tokens to an LLM, and steal your foreground window focus just to click one button.
+**Google Antigravity** ships with powerful coding, terminal, and browser subagents — **but it does not yet ship with a native desktop Computer Use engine** for controlling local macOS apps (Finder, Notes, WPS/Office, MarginNote, Keynote, WeChat, etc.). Meanwhile, traditional screenshot-based Computer Use tools send megabytes of full-screen PNGs every turn, burn vision tokens, break prompt caching, and hijack your foreground window.
 
-**MacGhost v2.0** is built from scratch on native Apple APIs (`Accessibility`, `ScreenCaptureKit`, `CoreGraphics`) and a zero-dependency Node.js 22 MCP server:
+**MacGhost v2.0** fills that gap from scratch on native Apple APIs (`Accessibility`, `ScreenCaptureKit`, `CoreGraphics`) and a zero-dependency Node.js 22 MCP server:
 
 - **Text-first, image-optional**: `get_state` reads a compact Accessibility (AX) control tree with stable `e<id>` refs and returns **incremental frame diffs** (`remove_ranges` + `upsert`) by default — zero image payload on normal UI workflows. Fall back to `capture_window` with normalized crops and `6×4` coordinate grids only for canvas or unlabeled surfaces.
 - **Up to 32 steps per round-trip**: `run_actions` executes sequential actions, waits, and assertions (`ax_press`, `ax_set_value`, `click`, `scroll`, `type_text`, `press_key`, `paste`, `perform_secondary_action`, `drag`, `select_text`, `wait`, `assert`) in one MCP call, stopping immediately on stale frames or focus drift.
